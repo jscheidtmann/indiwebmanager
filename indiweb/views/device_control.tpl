@@ -23,7 +23,7 @@
               <div class="form-group">
                 <label>Device Status:</label>
                 <span id="device_status" class="label label-info">Loading...</span>
-                <small class="text-muted" style="margin-left: 10px;">Properties update automatically</small>
+                <small class="text-muted" style="margin-left: 10px;">Real-time WebSocket updates</small>
               </div>
             </div>
           </div>
@@ -109,25 +109,34 @@
     var deviceName = "{{device_name}}";
     var deviceStructure = {};
     var lastUpdateTime = Date.now();
-    var lastPollTime = Date.now() / 1000; // Track last poll timestamp in seconds
     var messageLog = [];
     var maxMessages = 100;
     var isConnected = true; // Track connection state
     var reconnectAttempts = 0;
     var maxReconnectAttempts = 10;
     var reconnectTimeout = null;
+    var websocket = null;
+    var wsReconnectAttempts = 0;
+    var maxWsReconnectAttempts = 10;
 
     $(document).ready(function() {
       loadDeviceStructure();
 
-      // Start polling for changes every 1 second
-      setInterval(checkForUpdates, 1000);
+      // Initialize WebSocket connection for real-time updates
+      initWebSocket();
 
       // Initialize message log
       addMessage("info", "Device control panel loaded", "System");
 
       // Set up event handlers for copy and set buttons
       setupPropertyControls();
+
+      // Clean up WebSocket on page unload
+      $(window).on('beforeunload', function() {
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+          websocket.close();
+        }
+      });
     });
 
     function loadDeviceStructure() {
@@ -151,31 +160,147 @@
       });
     }
 
-    function checkForUpdates() {
-      var currentTime = Date.now() / 1000;
-      var pollUrl = "/api/devices/" + encodeURIComponent(deviceName) + "/poll?since=" + lastPollTime;
+    function initWebSocket() {
+      var protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      var wsUrl = protocol + '//' + window.location.host + '/ws/devices/' + encodeURIComponent(deviceName);
 
-      $.getJSON(pollUrl, function(dirtyProps) {
-        lastPollTime = currentTime; // Update poll timestamp
+      try {
+        websocket = new WebSocket(wsUrl);
 
-        // Connection is working - ensure we're in connected state
-        if (!isConnected) {
+        websocket.onopen = function(event) {
+          console.log('WebSocket connected:', event);
+          wsReconnectAttempts = 0;
           setConnectionState(true);
-        }
+          addMessage("success", "WebSocket connection established", "System");
+        };
 
-        if (dirtyProps && dirtyProps.length > 0) {
-          console.log('Dirty properties:', dirtyProps);
-          fetchUpdatedProperties(dirtyProps);
-        }
-      }).fail(function(xhr, status, error) {
-        console.error('Failed to check for updates:', error);
-        addMessage("warning", "Connection check failed: " + error, "System");
+        websocket.onmessage = function(event) {
+          var message = JSON.parse(event.data);
+          handleWebSocketMessage(message);
+        };
 
-        // Set disconnected state
+        websocket.onclose = function(event) {
+          console.log('WebSocket closed:', event);
+          setConnectionState(false);
+          addMessage("warning", "WebSocket connection closed", "System");
+
+          // Attempt reconnection
+          attemptWebSocketReconnection();
+        };
+
+        websocket.onerror = function(error) {
+          console.error('WebSocket error:', error);
+          addMessage("error", "WebSocket connection error", "System");
+        };
+      } catch (error) {
+        console.error('Failed to create WebSocket:', error);
+        addMessage("error", "Failed to create WebSocket connection: " + error.message, "System");
         setConnectionState(false);
+      }
+    }
 
-        // The automatic reconnection will be handled by setConnectionState(false)
-      });
+    function handleWebSocketMessage(message) {
+      console.log('WebSocket message received:', message);
+
+      switch (message.type) {
+        case 'property_update':
+          if (message.property_data) {
+            // Check if this is a new property being defined or an existing one being updated
+            if (message.event_type === 'property_defined') {
+              handlePropertyDefined(message.property_name, message.property_data);
+            } else {
+              // Regular property update
+              var updatedProps = {};
+              updatedProps[message.property_name] = message.property_data;
+              updateProperties(updatedProps);
+            }
+          }
+          break;
+
+        case 'property_deleted':
+          handlePropertyDeleted(message.property_name);
+          break;
+
+        case 'device_message':
+          addMessage("info", message.message, deviceName);
+          break;
+
+        case 'connection_status':
+          if (message.status === 'connected') {
+            addMessage("success", "Device connection confirmed", "System");
+          }
+          break;
+
+        case 'keepalive':
+          // Respond to keepalive
+          if (websocket && websocket.readyState === WebSocket.OPEN) {
+            websocket.send("ping");
+          }
+          break;
+      }
+    }
+
+    function handlePropertyDefined(propertyName, propertyData) {
+      console.log('New property defined:', propertyName, propertyData);
+
+      var groupName = propertyData.group || "Main";
+
+      // Add to device structure
+      if (!deviceStructure[groupName]) {
+        deviceStructure[groupName] = {};
+      }
+      deviceStructure[groupName][propertyName] = propertyData;
+
+      // Rebuild the display to include the new property
+      buildPropertyDisplay();
+
+      addMessage("success", 'New property "' + propertyName + '" appeared in group "' + groupName + '"', deviceName);
+    }
+
+    function handlePropertyDeleted(propertyName) {
+      console.log('Property deleted:', propertyName);
+
+      // Find and remove the property from deviceStructure
+      var found = false;
+      for (var groupName in deviceStructure) {
+        if (deviceStructure[groupName][propertyName]) {
+          delete deviceStructure[groupName][propertyName];
+          found = true;
+
+          // If the group is now empty, remove it
+          if (Object.keys(deviceStructure[groupName]).length === 0) {
+            delete deviceStructure[groupName];
+          }
+          break;
+        }
+      }
+
+      if (found) {
+        // Rebuild the display to remove the property
+        buildPropertyDisplay();
+        addMessage("warning", 'Property "' + propertyName + '" disappeared', deviceName);
+      }
+    }
+
+    function attemptWebSocketReconnection() {
+      if (wsReconnectAttempts >= maxWsReconnectAttempts) {
+        $("#device_status").text("Disconnected - Max WebSocket retries reached");
+        addMessage("error", "Maximum WebSocket reconnection attempts reached. Please refresh the page.", "System");
+        return;
+      }
+
+      wsReconnectAttempts++;
+      var retryDelay = Math.min(5000 * wsReconnectAttempts, 30000); // Exponential backoff, max 30s
+
+      $("#device_status").removeClass("label-danger")
+                        .addClass("label-warning")
+                        .text("Reconnecting... (attempt " + wsReconnectAttempts + "/" + maxWsReconnectAttempts + ")");
+
+      addMessage("info", "Attempting WebSocket reconnection #" + wsReconnectAttempts + " in " + (retryDelay/1000) + " seconds...", "System");
+
+      reconnectTimeout = setTimeout(function() {
+        initWebSocket();
+      }, retryDelay);
     }
 
     function setConnectionState(connected) {
@@ -195,7 +320,7 @@
 
         $("#device_status").removeClass("label-warning label-danger")
                           .addClass("label-success")
-                          .text("Connected - Auto-updating");
+                          .text("Connected - Real-time updates");
         addMessage("success", "Connection restored", "System");
       } else {
         // Add disconnected styling and disable all interactive controls
@@ -229,27 +354,14 @@
       addMessage("info", "Attempting reconnection #" + reconnectAttempts + " in " + (retryDelay/1000) + " seconds...", "System");
 
       reconnectTimeout = setTimeout(function() {
+        // Try both device structure reload and WebSocket reconnection
         loadDeviceStructure();
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+          attemptWebSocketReconnection();
+        }
       }, retryDelay);
     }
 
-    function fetchUpdatedProperties(propertyNames) {
-      $.ajax({
-        type: 'POST',
-        url: '/api/devices/' + encodeURIComponent(deviceName) + '/properties/batch',
-        data: JSON.stringify({ properties: propertyNames }),
-        contentType: 'application/json',
-        success: function(updatedProps) {
-          console.log('Updated properties:', updatedProps);
-          updateProperties(updatedProps);
-          addMessage("info", "Updated " + Object.keys(updatedProps).length + " properties", "System");
-        },
-        error: function(xhr, status, error) {
-          console.error('Failed to fetch updated properties:', error);
-          addMessage("error", "Failed to fetch property updates: " + error, "System");
-        }
-      });
-    }
 
     function buildPropertyDisplay() {
       // Remember currently active tab
@@ -289,8 +401,6 @@
     }
 
     function updateProperties(updatedProps) {
-      var needsStructureReload = false;
-
       // Update the device structure with new property values
       for (var propName in updatedProps) {
         var updatedProp = updatedProps[propName];
@@ -299,14 +409,15 @@
         if (deviceStructure[groupName] && deviceStructure[groupName][propName]) {
           var oldProp = deviceStructure[groupName][propName];
 
-          // Check for CONNECTION property changes that might affect device structure
+          // Check for CONNECTION property changes for logging
           if (propName === 'CONNECTION') {
             var oldConnectValue = oldProp.elements.CONNECT ? oldProp.elements.CONNECT.value : 'Off';
             var newConnectValue = updatedProp.elements.CONNECT ? updatedProp.elements.CONNECT.value : 'Off';
 
             if (oldConnectValue !== newConnectValue) {
               addMessage("info", 'Device connection changed: ' + oldConnectValue + ' → ' + newConnectValue, deviceName);
-              needsStructureReload = true;
+              // Note: Structure changes will be handled via WebSocket property_defined/property_deleted events
+              // No manual reload needed since properties will appear/disappear via real-time events
             }
           }
 
@@ -346,14 +457,8 @@
         }
       }
 
-      // If CONNECTION changed, reload the entire device structure after a short delay
-      // to allow new properties to be fully available
-      if (needsStructureReload) {
-        addMessage("info", "Device connection state changed, reloading device structure...", "System");
-        setTimeout(function() {
-          loadDeviceStructure();
-        }, 1500); // Wait 1.5 seconds for device to fully connect/disconnect
-      }
+      // Note: Structure changes (properties appearing/disappearing) are now handled
+      // via WebSocket property_defined/property_deleted events in real-time
     }
 
     function updatePropertyUI(propName, prop) {

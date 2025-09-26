@@ -9,8 +9,11 @@ from threading import Timer
 import subprocess
 import platform
 from importlib_metadata import version
+import asyncio
+from typing import Dict, Set
+from weakref import WeakSet
 
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -89,12 +92,200 @@ collection.parse_custom_drivers(db.get_custom_drivers())
 
 app = FastAPI(title="INDI Web Manager", version="1.0.0")
 
+@app.on_event("startup")
+async def startup_event():
+    """Store the main event loop for cross-thread access"""
+    global main_event_loop
+    main_event_loop = asyncio.get_running_loop()
+    logging.info("Main event loop stored for WebSocket broadcasting")
+
 # Serve static files
 app.mount("/static", StaticFiles(directory=views_path), name="static")
+
+# WebSocket connection manager
+class WebSocketManager:
+    def __init__(self):
+        self.device_connections: Dict[str, Set[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, device_name: str):
+        await websocket.accept()
+        if device_name not in self.device_connections:
+            self.device_connections[device_name] = set()
+        self.device_connections[device_name].add(websocket)
+        logging.info(f"WebSocket connected for device: {device_name}")
+
+    def disconnect(self, websocket: WebSocket, device_name: str):
+        if device_name in self.device_connections:
+            self.device_connections[device_name].discard(websocket)
+            if not self.device_connections[device_name]:
+                del self.device_connections[device_name]
+        logging.info(f"WebSocket disconnected for device: {device_name}")
+
+    async def broadcast_to_device(self, device_name: str, data: dict):
+        if device_name in self.device_connections:
+            disconnected = set()
+            for websocket in self.device_connections[device_name].copy():
+                try:
+                    await websocket.send_json(data)
+                except Exception as e:
+                    logging.error(f"WebSocket send error: {e}")
+                    disconnected.add(websocket)
+
+            # Clean up disconnected sockets
+            for websocket in disconnected:
+                self.device_connections[device_name].discard(websocket)
+
+websocket_manager = WebSocketManager()
+
+# Global flag to track if event listener should be auto-registered
+_auto_register_websocket_listener = True
+
+# Global reference to the main event loop
+main_event_loop = None
+
+# INDI event listener for WebSocket broadcasting
+def indi_event_listener(event_type: str, device_name: str, data: dict):
+    """Handle INDI events and broadcast to WebSocket clients"""
+    import logging
+    import threading
+
+    logging.info(f"INDI Event: {event_type} - {device_name} - {data.get('name', 'N/A') if data else 'N/A'}")
+
+    try:
+        # Use the stored main event loop
+        if main_event_loop is None:
+            logging.warning("No event loop available for WebSocket broadcast")
+            return
+
+        loop = main_event_loop
+
+        if event_type in ['property_updated', 'property_defined']:
+            message = {
+                'type': 'property_update',
+                'device': device_name,
+                'property_name': data.get('name') if data else None,
+                'property_data': data,
+                'event_type': event_type,
+                'timestamp': loop.time()
+            }
+
+            # Use call_soon_threadsafe for thread-safe scheduling
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(websocket_manager.broadcast_to_device(device_name, message))
+            )
+
+        elif event_type == 'property_deleted':
+            message = {
+                'type': 'property_deleted',
+                'device': device_name,
+                'property_name': data.get('name') if data else None,
+                'timestamp': loop.time()
+            }
+
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(websocket_manager.broadcast_to_device(device_name, message))
+            )
+
+        elif event_type == 'message':
+            message = {
+                'type': 'device_message',
+                'device': device_name,
+                'message': data.get('message') if data else None,
+                'timestamp': data.get('timestamp') if data else None
+            }
+
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(websocket_manager.broadcast_to_device(device_name, message))
+            )
+
+    except Exception as e:
+        logging.error(f"Error in INDI event listener: {e}")
+        logging.exception("Full traceback:")
+
+
+def ensure_websocket_listener_registered():
+    """
+    Ensure the WebSocket event listener is registered with the INDI client.
+
+    This function can be called safely multiple times - it won't add duplicates.
+    """
+    if not _auto_register_websocket_listener:
+        return False
+
+    from indiweb.indi_client import get_indi_client
+    client = get_indi_client()
+    if client and client.is_connected():
+        # Check if listener is already registered by checking the listeners list
+        if indi_event_listener not in client.listeners:
+            client.add_listener(indi_event_listener)
+            logging.info("WebSocket event listener registered with INDI client")
+            return True
+        else:
+            logging.debug("WebSocket event listener already registered")
+            return True
+    return False
 
 
 saved_profile = None
 active_profile = ""
+
+
+async def start_indi_client_with_listener(host='localhost', port=7624):
+    """
+    Start INDI client and register WebSocket event listener.
+
+    This function centralizes the logic for starting the INDI client
+    and registering the WebSocket event listener to ensure it happens
+    consistently across all startup paths.
+    """
+    from indiweb.indi_client import start_indi_client, get_indi_client
+
+    logging.info(f"Starting INDI client connection to {host}:{port}")
+
+    if start_indi_client(host, port):
+        # Register the WebSocket event listener safely
+        if ensure_websocket_listener_registered():
+            return True
+        else:
+            logging.error("Failed to register WebSocket event listener")
+            return False
+    else:
+        logging.error(f"Failed to start INDI client connection to {host}:{port}")
+        return False
+
+
+def start_indi_client_delayed(profile_name, delay=3):
+    """
+    Start INDI client after a delay (for use with profiles that start the server).
+
+    Args:
+        profile_name (str): Name of the profile to get port from
+        delay (int): Delay in seconds before starting client
+    """
+    import asyncio
+    import threading
+
+    async def delayed_start():
+        await asyncio.sleep(delay)
+        profile_info = db.get_profile(profile_name)
+        port = profile_info.get('port', 7624) if profile_info else 7624
+        success = await start_indi_client_with_listener('localhost', port)
+        if success:
+            logging.info(f"INDI client started successfully for profile '{profile_name}'")
+        else:
+            logging.error(f"Failed to start INDI client for profile '{profile_name}'")
+
+    # Run in a separate thread to avoid blocking
+    def run_async():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(delayed_start())
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=run_async, daemon=True)
+    thread.start()
 
 
 def start_profile(profile):
@@ -172,6 +363,11 @@ def start_profile(profile):
         if info['autoconnect'] == 1:
             t = Timer(3, indi_server.auto_connect)
             t.start()
+
+        # Start INDI client with WebSocket event listener after server starts
+        # Only if this is an autostart profile or explicitly requested
+        if info.get('autostart') == 1:
+            start_indi_client_delayed(profile, delay=5)
 
 
 @app.get("/", response_class=HTMLResponse, tags=["Web Interface"])
@@ -384,7 +580,17 @@ async def start_server(profile: str, response: Response):
         await asyncio.sleep(3)  # Wait for server to start
         profile_info = db.get_profile(profile)
         port = profile_info.get('port', 7624) if profile_info else 7624
-        start_indi_client('localhost', port)
+
+        # Try the async version first, if that fails, use the sync approach
+        try:
+            success = await start_indi_client_with_listener('localhost', port)
+            if not success:
+                logging.warning("Async INDI client start failed, trying delayed approach")
+                start_indi_client_delayed(profile, delay=2)
+        except Exception as e:
+            logging.error(f"Error starting INDI client: {e}")
+            # Fallback to delayed approach
+            start_indi_client_delayed(profile, delay=2)
 
     asyncio.create_task(start_client())
 
@@ -1061,6 +1267,68 @@ async def set_device_property(device_name: str, property_name: str, request: Req
         logging.error(f"Unexpected error setting property {device_name}.{property_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+
+###############################################################################
+# WebSocket endpoint for real-time device events
+###############################################################################
+
+@app.websocket("/ws/devices/{device_name}")
+async def device_websocket(websocket: WebSocket, device_name: str):
+    """
+    WebSocket endpoint for real-time device property updates.
+
+    Establishes a persistent connection to stream INDI property changes
+    and device messages in real-time, replacing the need for polling.
+
+    Args:
+        websocket: The WebSocket connection
+        device_name: Name of the device to monitor
+
+    WebSocket message format:
+    {
+        "type": "property_update" | "device_message" | "connection_status",
+        "device": "device_name",
+        "property_name": "property_name", // for property_update
+        "property_data": {...}, // for property_update
+        "message": "text", // for device_message
+        "timestamp": float
+    }
+    """
+    await websocket_manager.connect(websocket, device_name)
+
+    try:
+        # Send initial connection confirmation
+        await websocket.send_json({
+            "type": "connection_status",
+            "device": device_name,
+            "status": "connected",
+            "timestamp": asyncio.get_event_loop().time()
+        })
+
+        # Keep connection alive and handle any client messages
+        while True:
+            try:
+                # Wait for client messages (like ping/pong for keepalive)
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                # Handle client messages if needed (e.g., ping/pong)
+                if message == "ping":
+                    await websocket.send_text("pong")
+            except asyncio.TimeoutError:
+                # Send keepalive ping
+                try:
+                    await websocket.send_json({
+                        "type": "keepalive",
+                        "timestamp": asyncio.get_event_loop().time()
+                    })
+                except:
+                    break
+
+    except WebSocketDisconnect:
+        logging.info(f"WebSocket client disconnected from device: {device_name}")
+    except Exception as e:
+        logging.error(f"WebSocket error for device {device_name}: {e}")
+    finally:
+        websocket_manager.disconnect(websocket, device_name)
 
 
 ###############################################################################

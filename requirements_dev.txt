@@ -1,0 +1,4 @@
+# Development and test dependencies for INDI Web Manager
+pytest==7.4.4
+pytest-asyncio==0.21.1
+websocket-client==1.6.4

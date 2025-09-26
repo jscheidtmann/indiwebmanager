@@ -141,6 +141,15 @@ class INDIClient(PyIndi.BaseClient):
         self.connected = True
         logging.info(f"Server connected ({self.getHost()}:{self.getPort()})")
 
+        # Auto-register WebSocket event listener if available
+        try:
+            # Import here to avoid circular imports
+            from indiweb.main import ensure_websocket_listener_registered
+            ensure_websocket_listener_registered()
+        except ImportError:
+            # Not available during testing or early initialization
+            pass
+
     def serverDisconnected(self, exit_code):
         """Called when server disconnects"""
         self.connected = False
